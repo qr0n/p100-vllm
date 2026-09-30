@@ -1,0 +1,353 @@
+From f966781f4ce5243d5d90a95fd82885d130d9fb77 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:40:40 +0000
+Subject: [PATCH 6/7] [Pascal] GPTQ/AutoRound without Marlin, and an sm_60
+ exllama GPTQ kernel
+
+- auto_gptq / INC: only require Marlin on sm_75+, so pre-Turing falls back
+  to the exllama kernel instead of refusing to load.
+- q_gemm.cu: on cc < 7.0 the 4-bit exllama GEMM masks nibbles straight into
+  subnormal fp16 (q * 2^-24, exact; HFMA2 is full rate on subnormals on
+  sm_60), pre-scales activations per 128-row slice and removes the zero point
+  in fp32 per 32 rows. M=4 GEMM ~300 -> ~390 GB/s. VLLM_GPTQ_SM60_KERNEL=0
+  selects the stock kernel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../quantization/gptq/q_gemm.cu               | 210 ++++++++++++++++++
+ .../layers/quantization/auto_gptq.py          |  14 +-
+ .../inc/schemes/inc_wna16_linear.py           |   4 +-
+ 3 files changed, 222 insertions(+), 6 deletions(-)
+
+diff --git a/csrc/libtorch_stable/quantization/gptq/q_gemm.cu b/csrc/libtorch_stable/quantization/gptq/q_gemm.cu
+index 6ce6f6a90..f2d499c87 100644
+--- a/csrc/libtorch_stable/quantization/gptq/q_gemm.cu
++++ b/csrc/libtorch_stable/quantization/gptq/q_gemm.cu
+@@ -4,6 +4,7 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
+ */
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstdio>
+ 
+ #include "../../torch_utils.h"
+@@ -12,6 +13,10 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
+ #include <cuda_fp16.h>
+ 
+ #include "compat.cuh"
++
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
++  #define VLLM_GPTQ_H2_ACC32
++#endif
+ #include "matrix_view.cuh"
+ #include "qdq_2.cuh"
+ #include "qdq_3.cuh"
+@@ -207,6 +212,16 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
+       dequant_4bit_8_prep_zero(zeros[3] + zero_offset, z1z16[3], y1y16[3]);
+     }
+ 
++#ifdef VLLM_GPTQ_H2_ACC32
++    // Keep the fp16 partial over all 32 rows of this step and convert/scale
++    // once, instead of once per 8 rows: ~30% fewer instructions per weight
++    // word at small M, where this kernel is issue-bound (sm_60).
++    half2 hacc[m_count][4];
++  #pragma unroll
++    for (int m = 0; m < m_count; m++)
++  #pragma unroll
++      for (int c = 0; c < 4; c++) hacc[m][c] = __float2half2_rn(0.f);
++#endif
+ #pragma unroll
+     for (int j = 0; j < 4; j++) {
+       const int4* b_ptr4 = (int4*)b_ptr;
+@@ -224,6 +239,14 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
+ 
+ #pragma unroll
+       for (int m = 0; m < m_count; m++) {
++#ifdef VLLM_GPTQ_H2_ACC32
++        const half2* a2 = (const half2*)(a_ptr + m * a_stride);
++  #pragma unroll
++        for (int c = 0; c < 4; c++)
++  #pragma unroll
++          for (int i = 0; i < 4; i++)
++            hacc[m][c] = __hfma2(dq[c][i], a2[i], hacc[m][c]);
++#else
+         block_c[m][0] = fma(dot22_8_f(dq[0], a_ptr + m * a_stride), scales[0],
+                             block_c[m][0]);
+         block_c[m][1] = fma(dot22_8_f(dq[1], a_ptr + m * a_stride), scales[1],
+@@ -232,11 +255,21 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
+                             block_c[m][2]);
+         block_c[m][3] = fma(dot22_8_f(dq[3], a_ptr + m * a_stride), scales[3],
+                             block_c[m][3]);
++#endif
+       }
+ 
+       b_ptr += size_n;
+       a_ptr += 8;
+     }
++#ifdef VLLM_GPTQ_H2_ACC32
++  #pragma unroll
++    for (int m = 0; m < m_count; m++)
++  #pragma unroll
++      for (int c = 0; c < 4; c++) {
++        const float2 f = __half22float2(hacc[m][c]);
++        block_c[m][c] = fma(f.x + f.y, scales[c], block_c[m][c]);
++      }
++#endif
+ 
+     k += 32;
+   }
+@@ -252,6 +285,157 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
+   }
+ }
+ 
++// Pascal (sm_60) variant of the 4-bit kernel above, used for small M. Same
++// grid, block, layout and split-K atomics; different inner loop:
++//  - nibbles are masked straight into SUBNORMAL fp16 bit patterns
++//    (q * 2^-24, exact; HFMA2 is full rate on subnormals on sm_60) instead of
++//    the bias-OR + subtract/scale dequant: 5 instead of ~9 ops per word;
++//  - the 16x factor of the odd nibble pair is folded into the shared copy of
++//    the activations, which is also pre-scaled per 128-row slice by 2^e so
++//    the products land in normal fp16 range;
++//  - the zero point comes off once per 32 rows in fp32 with the activation
++//    sum, and fp16 partials are flushed to fp32 once per 32 rows, not per 8.
++template <bool first_block, int m_count>
++__global__ void __launch_bounds__(BLOCK_KN_SIZE)
++    gemm_half_q_half_gptq_4bit_kernel_sm60(
++        const half* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
++        const uint32_t* __restrict__ b_gptq_qzeros,
++        const half* __restrict__ b_gptq_scales, half* __restrict__ c,
++        const int size_m, const int size_n, const int size_k, const int groups,
++        const bool use_v2_format) {
++  MatrixView_half a_(a, size_m, size_k);
++  MatrixView_half_rw c_(c, size_m, size_n);
++  MatrixView_q4_row b_gptq_qzeros_(b_gptq_qzeros, groups, size_n);
++  MatrixView_half b_gptq_scales_(b_gptq_scales, groups, size_n);
++  const int zero_offset = use_v2_format ? 0 : 1;
++
++  const int t = threadIdx.x;
++  const int lane = t & 31, warp = t >> 5;
++  const int offset_n = blockIdx.x * BLOCK_KN_SIZE * 4;
++  const int offset_m = blockIdx.y * m_count;
++  const int offset_k = blockIdx.z * BLOCK_KN_SIZE;
++  const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
++  const int n = offset_n + t * 4;
++
++  __shared__ half block_a[m_count][BLOCK_KN_SIZE];
++  __shared__ float amax_w[m_count][BLOCK_KN_SIZE / 32];
++  __shared__ float asum_w[m_count][BLOCK_KN_SIZE / 32];  // per 32-row step
++  __shared__ float inv_s[m_count];
++
++  float av[m_count];
++#pragma unroll
++  for (int m = 0; m < m_count; ++m) {
++    av[m] = offset_k + t < end_k ? __half2float(*a_.item_ptr(offset_m + m, offset_k + t))
++                                 : 0.f;
++    float mx = fabsf(av[m]), sm = av[m];
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
++      sm += __shfl_xor_sync(0xffffffffu, sm, o);
++    }
++    if (lane == 0) {
++      amax_w[m][warp] = mx;
++      asum_w[m][warp] = sm;
++    }
++  }
++  __syncthreads();
++#pragma unroll
++  for (int m = 0; m < m_count; ++m) {
++    float mx = 0.f;
++#pragma unroll
++    for (int w = 0; w < BLOCK_KN_SIZE / 32; ++w) mx = fmaxf(mx, amax_w[m][w]);
++    int e = 0;
++    if (mx > 0.f) {
++      int ex;
++      frexpf(mx, &ex);  // mx < 2^ex, so |a| * 2^(14 - ex) < 2^14
++      e = 14 - ex;
++    }
++    const int pos = t & 7;  // rows 2,3,6,7 of each word pair with 16*q
++    const float sc = ldexpf(1.f, e) * ((pos & 2) ? 0.0625f : 1.f);
++    block_a[m][t] = __float2half_rn(av[m] * sc);
++    if (t == 0) inv_s[m] = ldexpf(1.f, 24 - e);
++  }
++  __syncthreads();
++  if (n >= size_n) return;
++
++  const int groupsize = size_k / groups;
++  int group = offset_k / groupsize;
++  int nextgroup = offset_k + groupsize;
++  const uint32_t* b_ptr = b_q_weight + (offset_k / 8) * size_n + n;
++
++  int zeros[4];
++  float scales[4], zf[4];
++  b_gptq_qzeros_.item4(zeros, group, n);
++  b_gptq_scales_.item4_f(scales, group, n);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) zf[i] = (float)(zeros[i] + zero_offset);
++
++  float block_c[m_count][4] = {};
++  int step = 0;
++  for (int k = offset_k; k < end_k; k += 32, ++step) {
++    if (k == nextgroup) {
++      group++;
++      nextgroup += groupsize;
++      b_gptq_qzeros_.item4(zeros, group, n);
++      b_gptq_scales_.item4_f(scales, group, n);
++#pragma unroll
++      for (int i = 0; i < 4; ++i) zf[i] = (float)(zeros[i] + zero_offset);
++    }
++    half2 hacc[m_count][4];
++#pragma unroll
++    for (int m = 0; m < m_count; ++m)
++#pragma unroll
++      for (int i = 0; i < 4; ++i) hacc[m][i] = __float2half2_rn(0.f);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++      const int4 w4 = *reinterpret_cast<const int4*>(b_ptr);
++      const uint32_t wv[4] = {(uint32_t)w4.x, (uint32_t)w4.y, (uint32_t)w4.z,
++                              (uint32_t)w4.w};
++      uint32_t d[4][4];
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const uint32_t w0 = wv[i], w1 = w0 >> 8;
++        d[i][0] = w0 & 0x000f000fu;
++        d[i][1] = w0 & 0x00f000f0u;
++        d[i][2] = w1 & 0x000f000fu;
++        d[i][3] = w1 & 0x00f000f0u;
++      }
++#pragma unroll
++      for (int m = 0; m < m_count; ++m) {
++        const half2* ap = reinterpret_cast<const half2*>(block_a[m]) + (step * 32 + j * 8) / 2;
++        const half2 x0 = ap[0], x1 = ap[1], x2 = ap[2], x3 = ap[3];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++          hacc[m][i] = __hfma2(*reinterpret_cast<const half2*>(&d[i][0]), x0, hacc[m][i]);
++          hacc[m][i] = __hfma2(*reinterpret_cast<const half2*>(&d[i][1]), x1, hacc[m][i]);
++          hacc[m][i] = __hfma2(*reinterpret_cast<const half2*>(&d[i][2]), x2, hacc[m][i]);
++          hacc[m][i] = __hfma2(*reinterpret_cast<const half2*>(&d[i][3]), x3, hacc[m][i]);
++        }
++      }
++      b_ptr += size_n;
++    }
++#pragma unroll
++    for (int m = 0; m < m_count; ++m) {
++      const float inv = inv_s[m], as = asum_w[m][step];
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const float2 f = __half22float2(hacc[m][i]);
++        block_c[m][i] = fmaf(scales[i], fmaf(f.x + f.y, inv, -zf[i] * as), block_c[m][i]);
++      }
++    }
++  }
++
++  for (int m = 0; m < m_count; m++) {
++    half2* out = (half2*)c_.item_ptr(offset_m + m, n);
++    half2 result01 = __halves2half2(__float2half_rn(block_c[m][0]),
++                                    __float2half_rn(block_c[m][1]));
++    half2 result23 = __halves2half2(__float2half_rn(block_c[m][2]),
++                                    __float2half_rn(block_c[m][3]));
++    atomicAdd(out, result01);
++    atomicAdd(out + 1, result23);
++  }
++}
++
+ template <bool first_block, int m_count>
+ __global__ void gemm_half_q_half_gptq_2bit_kernel(
+     const half* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
+@@ -634,6 +818,20 @@ fp_gemm_half_q_half_gptq_kernel pick_gemm_half_q_half_gptq_kernel(
+   return NULL;
+ }
+ 
++// The subnormal-HFMA2 variant is tuned for (and only measured on) sm_60.
++// VLLM_GPTQ_SM60_KERNEL=0 turns it off.
++static bool gptq_use_sm60_kernel() {
++  static const bool use = [] {
++    const char* env = std::getenv("VLLM_GPTQ_SM60_KERNEL");
++    if (env && env[0] == '0') return false;
++    int dev = 0, major = 0;
++    cudaGetDevice(&dev);
++    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
++    return major < 7;
++  }();
++  return use;
++}
++
+ void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
+                                 const uint32_t* b_gptq_qzeros,
+                                 const half* b_gptq_scales, half* c, int size_m,
+@@ -649,6 +847,18 @@ void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
+ 
+   fp_gemm_half_q_half_gptq_kernel kernel =
+       pick_gemm_half_q_half_gptq_kernel(true, m_count, bit);
++  if (bit == 4 && gptq_use_sm60_kernel()) {
++    switch (m_count) {
++      case 1: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 1>; break;
++      case 2: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 2>; break;
++      case 3: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 3>; break;
++      case 4: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 4>; break;
++      case 5: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 5>; break;
++      case 6: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 6>; break;
++      case 7: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 7>; break;
++      case 8: kernel = gemm_half_q_half_gptq_4bit_kernel_sm60<true, 8>; break;
++    }
++  }
+ 
+   const cudaStream_t stream = get_current_cuda_stream();
+   kernel<<<gridDim, blockDim, 0, stream>>>(a, b_q_weight, b_gptq_qzeros,
+diff --git a/vllm/model_executor/layers/quantization/auto_gptq.py b/vllm/model_executor/layers/quantization/auto_gptq.py
+index ed430f744..eec9e85f0 100644
+--- a/vllm/model_executor/layers/quantization/auto_gptq.py
++++ b/vllm/model_executor/layers/quantization/auto_gptq.py
+@@ -59,6 +59,7 @@ from vllm.model_executor.parameter import (
+     PackedColumnParameter,
+     PackedvLLMParameter,
+ )
++from vllm.platforms import current_platform
+ from vllm.scalar_type import scalar_types
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
+ from vllm.utils.collection_utils import is_list_of
+@@ -313,11 +314,14 @@ class AutoGPTQLinearMethod(LinearMethodBase):
+         self.input_dtype = None
+         self.quant_type = self.quant_config.quant_type
+ 
+-        # Verify supported on platform.
+-        verify_marlin_supported(
+-            quant_type=self.quant_config.quant_type,
+-            group_size=self.quant_config.group_size,
+-        )
++        # Verify supported on platform. Below SM75 Marlin cannot run at all;
++        # choose_mp_linear_kernel falls back to e.g. ExllamaLinearKernel (and
++        # raises if no kernel fits), so only insist on Marlin where it exists.
++        if current_platform.has_device_capability(75):
++            verify_marlin_supported(
++                quant_type=self.quant_config.quant_type,
++                group_size=self.quant_config.group_size,
++            )
+ 
+     def create_weights(
+         self,
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
+index c9cacef1c..513b0d3b0 100644
+--- a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
+@@ -15,6 +15,7 @@ from vllm.model_executor.parameter import (
+     GroupQuantScaleParameter,
+     PackedvLLMParameter,
+ )
++from vllm.platforms import current_platform
+ from vllm.scalar_type import scalar_types
+ 
+ from .inc_scheme import INCLinearScheme
+@@ -53,7 +54,8 @@ class INCWNA16LinearScheme(INCLinearScheme):
+         use_marlin = (
+             self.layer_config.backend == "auto" or "marlin" in self.layer_config.backend
+         ) and (self.layer_config.bits, self.layer_config.sym) in gptq_type_map
+-        if use_marlin:
++        # Pre-Turing has no Marlin; AutoGPTQLinearMethod then picks Exllama.
++        if use_marlin and current_platform.has_device_capability(75):
+             use_marlin = check_marlin_supported(
+                 gptq_type_map[(self.layer_config.bits, self.layer_config.sym)],
+                 self.layer_config.group_size,
+-- 
+2.53.0
+

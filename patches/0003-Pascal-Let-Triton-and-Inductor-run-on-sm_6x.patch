@@ -1,0 +1,174 @@
+From 3496513f6048904d1053e6687bb5d7b9209449ed Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:40:40 +0000
+Subject: [PATCH 3/7] [Pascal] Let Triton and Inductor run on sm_6x
+
+torch hard-codes capability >= 7.0 in has_triton(), so Inductor raises
+GPUTooOldForTriton, and Triton emits sm_70-only memory-ordering and
+cache-hint PTX. vllm/platforms/pascal.py rebinds has_triton() and rewrites
+that PTX; cuda.py applies both when NVML reports a pre-Volta GPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/platforms/cuda.py   |  17 ++++++
+ vllm/platforms/pascal.py | 123 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 140 insertions(+)
+ create mode 100644 vllm/platforms/pascal.py
+
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index 68c3aa785..01cf22feb 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -1062,3 +1062,20 @@ finally:
+         pynvml.nvmlShutdown()
+ 
+ CudaPlatform = NvmlCudaPlatform if nvml_available else NonNvmlCudaPlatform
++
++# Pascal (sm_6x): Triton runs here, but torch hard-codes CUDA capability >= 7.0
++# in has_triton() (so Inductor raises GPUTooOldForTriton and Dynamo cannot
++# capture Triton kernels), and Triton emits sm_70-only memory-ordering and
++# cache-hint PTX. vllm/platforms/pascal.py fixes both, which lets the default
++# Inductor backend work. Only probed via NVML so CUDA is not initialized at
++# import time.
++if nvml_available:
++    with contextlib.suppress(Exception):
++        if not CudaPlatform.has_device_capability(70):
++            from vllm.platforms.pascal import (
++                patch_torch_has_triton,
++                patch_triton_for_pascal,
++            )
++
++            patch_triton_for_pascal()
++            patch_torch_has_triton()
+diff --git a/vllm/platforms/pascal.py b/vllm/platforms/pascal.py
+new file mode 100644
+index 000000000..4ea6e12f6
+--- /dev/null
++++ b/vllm/platforms/pascal.py
+@@ -0,0 +1,123 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Make Triton-generated PTX assemble on Pascal (sm_6x).
++
++Triton lowers atomics with a memory-ordering qualifier (``tl.atomic_add`` and
++friends default to ``sem="acq_rel"``) to PTX such as
++``atom.global.gpu.acq_rel.add.u32``. The ``.relaxed/.acquire/.release/
++.acq_rel`` qualifiers, ``ld.acquire``/``st.release`` and ``fence.*`` all
++require sm_70, so ptxas rejects them for sm_60/61. So do the L1/L2 cache
++eviction hints Inductor emits for ``eviction_policy``.
++
++Pre-Volta hardware gets the same ordering from a plain (relaxed) atomic or a
++volatile load/store bracketed by ``membar``. This module rewrites the PTX text
++after Triton generates it and before ptxas sees it, only when the target is
++below sm_70.
++"""
++
++import re
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_SEMS = {"relaxed", "acquire", "release", "acq_rel", "sc"}
++_MEMBAR = {"cta": "membar.cta;", "gpu": "membar.gl;", "sys": "membar.sys;"}
++
++# Optional predicate, opcode, dotted qualifiers, operands.
++_INSN = re.compile(
++    r"^(?P<indent>\s*)(?P<pred>@!?%\w+\s+)?"
++    r"(?P<op>atom|red|ld|st|fence)(?P<quals>(?:\.\w+)+)(?P<rest>.*)$"
++)
++
++
++# Cache-eviction / L2 prefetch-size hints (e.g. Inductor's eviction_policy=
++# "evict_last" -> ld.global.L1::evict_last) need sm_70+/sm_75+. They only steer
++# cache policy, so on Pascal they are dropped.
++_CACHE_HINT = re.compile(r"\.L1::(?:evict_\w+|no_allocate)|\.L2::(?:evict_\w+|64B|128B|256B)")
++
++
++def _rewrite_line(line: str) -> list[str]:
++    if ("ld." in line or "st." in line) and "::" in line:
++        line = _CACHE_HINT.sub("", line)
++    m = _INSN.match(line)
++    if m is None:
++        return [line]
++    quals = m["quals"].split(".")[1:]
++    sems = [q for q in quals if q in _SEMS]
++    if not sems:
++        return [line]
++    sem = sems[0]
++    scope = next((q for q in quals if q in _MEMBAR), "gpu")
++    fence = m["indent"] + _MEMBAR[scope]
++    op = m["op"]
++
++    if op == "fence":
++        return [fence]
++
++    kept = [q for q in quals if q not in _SEMS]
++    if op in ("ld", "st"):
++        # ld/st take .volatile instead of a scope on sm_6x.
++        kept = ["volatile"] + [q for q in kept if q not in _MEMBAR]
++    new = f"{m['indent']}{m['pred'] or ''}{op}.{'.'.join(kept)}{m['rest']}"
++
++    before = sem in ("release", "acq_rel", "sc")
++    after = sem in ("acquire", "acq_rel", "sc")
++    return ([fence] if before else []) + [new] + ([fence] if after else [])
++
++
++def rewrite_ptx_for_pascal(ptx: str) -> str:
++    out: list[str] = []
++    for line in ptx.splitlines():
++        out.extend(_rewrite_line(line))
++    return "\n".join(out) + ("\n" if ptx.endswith("\n") else "")
++
++
++def patch_torch_has_triton() -> None:
++    """Let Dynamo treat Triton kernels as kernels on sm_6x.
++
++    ``torch.utils._triton.has_triton()`` hard-codes CUDA capability >= 7.0.
++    When it is False, Dynamo does not recognise a Triton ``JITFunction`` launched
++    inside a compiled region (e.g. the FLA gated RMSNorm in Qwen3.5/3.8 GDN
++    layers) and tries to trace through Triton's Python launcher, failing with
++    "torch.* op returned non-Tensor". With the "eager" compile backend the
++    captured kernel is simply launched, which works on Pascal once the PTX is
++    rewritten (below). Rebinding every module-level reference to the original
++    function is needed because several torch modules import it by name.
++    """
++    import sys
++
++    import torch.utils._triton as torch_triton
++
++    orig = torch_triton.has_triton
++    if getattr(orig, "_vllm_pascal", False):
++        return
++
++    def has_triton() -> bool:
++        return torch_triton.has_triton_package()
++
++    has_triton._vllm_pascal = True  # type: ignore[attr-defined]
++    for module in list(sys.modules.values()):
++        if getattr(module, "has_triton", None) is orig:
++            module.has_triton = has_triton
++
++
++def patch_triton_for_pascal() -> None:
++    """Wrap Triton's CUDA make_ptx so sm < 70 targets get rewritten PTX."""
++    try:
++        from triton.backends.nvidia.compiler import CUDABackend
++    except ImportError:
++        return
++    if getattr(CUDABackend.make_ptx, "_vllm_pascal", False):
++        return
++    orig = CUDABackend.make_ptx
++
++    def make_ptx(self, src, metadata, opt, capability):
++        ptx = orig(self, src, metadata, opt, capability)
++        if int(capability) < 70:
++            ptx = rewrite_ptx_for_pascal(ptx)
++        return ptx
++
++    make_ptx._vllm_pascal = True  # type: ignore[attr-defined]
++    CUDABackend.make_ptx = make_ptx
++    logger.debug("Patched Triton PTX generation for pre-Volta GPUs.")
+-- 
+2.53.0
+

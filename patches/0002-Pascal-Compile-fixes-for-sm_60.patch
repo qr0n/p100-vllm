@@ -1,0 +1,87 @@
+From da2f0095b088f8842c109ec292adc80e529a6ed4 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:40:40 +0000
+Subject: [PATCH 2/7] [Pascal] Compile fixes for sm_60
+
+- dcp_direct_common.cuh: no .release/.acquire qualifiers before sm_70; use
+  a system fence plus volatile accesses.
+- moe_wna16.cu: emulate atomicAdd(half*) with a 32-bit CAS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../attention/dcp_utils/dcp_direct_common.cuh | 12 +++++++++++
+ csrc/libtorch_stable/moe/moe_wna16.cu         | 21 +++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/csrc/libtorch_stable/attention/dcp_utils/dcp_direct_common.cuh b/csrc/libtorch_stable/attention/dcp_utils/dcp_direct_common.cuh
+index 968f8c6d7..694f63a3a 100644
+--- a/csrc/libtorch_stable/attention/dcp_utils/dcp_direct_common.cuh
++++ b/csrc/libtorch_stable/attention/dcp_utils/dcp_direct_common.cuh
+@@ -55,20 +55,32 @@ __device__ __forceinline__ void multimem_store_release_system(uint32_t* mc_ptr,
+ 
+ __device__ __forceinline__ void store_release_system(uint32_t* ptr,
+                                                      uint32_t value) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
++  // Pascal has no .release qualifier: fence, then a volatile store.
++  __threadfence_system();
++  *reinterpret_cast<volatile uint32_t*>(ptr) = value;
++#else
+   uint64_t address = reinterpret_cast<uint64_t>(ptr);
+   asm volatile("st.global.release.sys.u32 [%0], %1;"
+                :
+                : "l"(address), "r"(value)
+                : "memory");
++#endif
+ }
+ 
+ __device__ __forceinline__ uint32_t load_acquire_system(const uint32_t* ptr) {
+   uint32_t value;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
++  // Pascal has no .acquire qualifier: volatile load, then a fence.
++  value = *reinterpret_cast<const volatile uint32_t*>(ptr);
++  __threadfence_system();
++#else
+   uint64_t address = reinterpret_cast<uint64_t>(ptr);
+   asm volatile("ld.global.acquire.sys.u32 %0, [%1];"
+                : "=r"(value)
+                : "l"(address)
+                : "memory");
++#endif
+   return value;
+ }
+ 
+diff --git a/csrc/libtorch_stable/moe/moe_wna16.cu b/csrc/libtorch_stable/moe/moe_wna16.cu
+index 9345a7c9f..d197cf0a1 100644
+--- a/csrc/libtorch_stable/moe/moe_wna16.cu
++++ b/csrc/libtorch_stable/moe/moe_wna16.cu
+@@ -11,6 +11,27 @@
+ #include "libtorch_stable/torch_utils.h"
+ #include "moe_wna16_utils.h"
+ 
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
++// Pascal has no native atomicAdd(half*, half); emulate it with a 32-bit CAS
++// on the aligned word containing the half.
++__device__ __forceinline__ void atomicAdd(half* address, half val) {
++  unsigned int* base = reinterpret_cast<unsigned int*>(
++      reinterpret_cast<size_t>(address) & ~static_cast<size_t>(2));
++  const bool hi = reinterpret_cast<size_t>(address) & 2;
++  unsigned int old = *base, assumed;
++  do {
++    assumed = old;
++    __half_raw cur;
++    cur.x = hi ? (assumed >> 16) : (assumed & 0xffffu);
++    half sum = __hadd(half(cur), val);
++    unsigned short sum_bits = __half_as_ushort(sum);
++    unsigned int updated = hi ? ((assumed & 0x0000ffffu) | (sum_bits << 16))
++                              : ((assumed & 0xffff0000u) | sum_bits);
++    old = atomicCAS(base, assumed, updated);
++  } while (assumed != old);
++}
++#endif
++
+ #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
+ 
+ template <typename scalar_t, int bit, int GROUPS>
+-- 
+2.53.0
+

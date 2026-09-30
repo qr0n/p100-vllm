@@ -1,0 +1,55 @@
+From e70db7f6377627a025d2cd1df6c09c1841b20a20 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:40:40 +0000
+Subject: [PATCH 1/7] [Pascal] Build for sm_60/sm_61
+
+Add 6.0/6.1 to the CUDA 12.x (<12.8) arch list and a build-pascal.sh that
+configures the C/CUDA extensions for TORCH_CUDA_ARCH_LIST=6.0 with gcc-13.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt  |  2 +-
+ build-pascal.sh | 18 ++++++++++++++++++
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+ create mode 100755 build-pascal.sh
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 02e098f2d..2cc3da562 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -128,7 +128,7 @@ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
+ else()
+-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0")
++  set(CUDA_SUPPORTED_ARCHS "6.0;6.1;7.0;7.5;8.0;8.6;8.7;8.9;9.0")
+ endif()
+ 
+ #
+diff --git a/build-pascal.sh b/build-pascal.sh
+new file mode 100755
+index 000000000..d4ad7e697
+--- /dev/null
++++ b/build-pascal.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++# Configure + build vLLM's C/CUDA extensions for Pascal (sm_60) in a persistent dir.
++# Usage: ./build-pascal.sh [ninja args...]   e.g. ./build-pascal.sh -k 0
++set -e
++cd "$(dirname "$0")"
++export PATH=$PWD/.venv/bin:$HOME/.cargo/bin:$PATH
++export TORCH_CUDA_ARCH_LIST=6.0 CUDAHOSTCXX=/usr/bin/g++-13 CC=gcc-13 CXX=g++-13 CUDA_HOME=/usr VLLM_TARGET_DEVICE=cuda
++B=build-pascal
++if [ ! -f $B/build.ninja ]; then
++  cmake -S . -B $B -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_TARGET_DEVICE=cuda \
++    -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
++    -DVLLM_PYTHON_EXECUTABLE=$PWD/.venv/bin/python \
++    -DVLLM_PYTHON_PATH="$(.venv/bin/python -c 'import sys;print(":".join(sys.path))')" \
++    -DFETCHCONTENT_BASE_DIR=$PWD/.deps -DNVCC_THREADS=1 \
++    -DCMAKE_JOB_POOL_COMPILE:STRING=compile -DCMAKE_JOB_POOLS:STRING=compile=24 \
++    -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc -DCMAKE_INSTALL_PREFIX=$PWD
++fi
++ninja -C $B "$@"
+-- 
+2.53.0
+

@@ -1,0 +1,629 @@
+From cf2d80b82df3af65c4a967e99d06de7db7450765 Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:40:40 +0000
+Subject: [PATCH 7/7] [Pascal] Attention kernels for head_size >= 256 on
+ pre-Volta
+
+The unified Triton attention kernel exceeds sm_60's 48 KB of shared memory
+at head_size 512 (Gemma 4 global layers) and pads/spills at 256. New
+pascal_splitd_attention.py: a split-head-dim prefill kernel and a dot-free
+decode kernel (tl.dot needs M >= 16; decode has 2-8 query rows per KV head).
+Gemma 4 31B, 2x P100, c=4: 21.5 -> 81.8 tok/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../attention/ops/pascal_splitd_attention.py  | 395 ++++++++++++++++++
+ .../attention/ops/triton_unified_attention.py | 191 +++++++++
+ 2 files changed, 586 insertions(+)
+ create mode 100644 vllm/v1/attention/ops/pascal_splitd_attention.py
+
+diff --git a/vllm/v1/attention/ops/pascal_splitd_attention.py b/vllm/v1/attention/ops/pascal_splitd_attention.py
+new file mode 100644
+index 000000000..4da55d973
+--- /dev/null
++++ b/vllm/v1/attention/ops/pascal_splitd_attention.py
+@@ -0,0 +1,395 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unified attention for head_size >= 256 on pre-Volta GPUs (Gemma 4).
++
++Pascal has 48 KB of shared memory per block and no MMA, so Triton upcasts
++``tl.dot`` operands to fp32 and stages them through shared memory. With
++head_size 512 the loop-invariant Q (16x512 fp32, 32 KB) plus one K tile
++(512x16 fp32, 32 KB) already exceeds the limit at the smallest legal tile.
++
++This kernel splits the head dimension into two halves: S is the sum of two
++256-wide dots and the output keeps two 256-wide accumulators. The Q halves
++are re-read from global memory every tile so they are not pinned in shared
++memory across the loop. Supports the subset Gemma 4 needs: unquantized KV,
++causal, sliding window, softcap, sinks, 2D and 3D (segmented) launches.
++"""
++
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.triton_attention_helpers import (
++    apply_softcap,
++    cdiv_fn,
++    compute_kv_seq_mask,
++    compute_tile_loop_bounds,
++    init_softmax_M,
++    resolve_seq_and_query_len,
++    softmax_step,
++    store_segm_reduce_scalars,
++)
++
++TILE_SIZE = 16
++
++
++@triton.jit
++def kernel_splitd_attention(
++    output_ptr,
++    query_ptr,
++    key_cache_ptr,
++    value_cache_ptr,
++    sink_ptr,
++    block_tables_ptr,
++    seq_lens_ptr,
++    scale,
++    softcap,
++    num_query_heads: tl.constexpr,
++    num_queries_per_kv: tl.constexpr,
++    block_table_stride: tl.int64,
++    query_stride_0: tl.int64,
++    query_stride_1: tl.int64,
++    output_stride_0: tl.int64,
++    output_stride_1: tl.int64,
++    BLOCK_SIZE: tl.constexpr,
++    TILE_SIZE: tl.constexpr,
++    HEAD_SIZE: tl.constexpr,
++    HALF: tl.constexpr,  # HEAD_SIZE_PADDED // 2
++    USE_SOFTCAP: tl.constexpr,
++    USE_SINKS: tl.constexpr,
++    SLIDING_WINDOW: tl.constexpr,
++    USE_CAUSAL: tl.constexpr,
++    USE_MM_PREFIX: tl.constexpr,
++    MAX_MM_RANGES: tl.constexpr,
++    mm_prefix_range_ptr,
++    stride_k_cache_0: tl.int64,
++    stride_k_cache_1: tl.int64,
++    stride_k_cache_2: tl.int64,
++    stride_k_cache_3: tl.constexpr,
++    stride_v_cache_0: tl.int64,
++    stride_v_cache_1: tl.int64,
++    stride_v_cache_2: tl.int64,
++    stride_v_cache_3: tl.constexpr,
++    query_start_len_ptr,
++    BLOCK_Q: tl.constexpr,
++    num_seqs: tl.int32,
++    BLOCK_M: tl.constexpr,
++    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
++    IS_3D: tl.constexpr,
++    segm_output_ptr=None,
++    segm_max_ptr=None,
++    segm_expsum_ptr=None,
++    MM_PREFIX_CLAMP_SW: tl.constexpr = False,
++):
++    HEAD_SIZE_PADDED: tl.constexpr = 2 * HALF
++    q_block_global_idx = tl.program_id(0)
++    kv_head_idx = tl.program_id(1)
++    segm_idx = tl.program_id(2) if IS_3D else 0
++
++    (
++        seq_idx,
++        q_block_local_idx,
++        cur_batch_in_all_start_index,
++        cur_batch_query_len,
++        seq_len,
++    ) = resolve_seq_and_query_len(
++        query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
++    )
++    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
++        return
++    if IS_3D:
++        tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
++        if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
++            return
++    else:
++        tiles_per_segment = 0
++
++    offs_m = tl.arange(0, BLOCK_M)
++    offs_h = tl.arange(0, HALF)
++    offs_t = tl.arange(0, TILE_SIZE)
++    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
++    query_offset_0 = cur_batch_in_all_start_index + query_pos
++    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
++    q_row = query_offset_0[:, None] * query_stride_0 + query_offset_1[:, None] * (
++        query_stride_1
++    )
++    mask_lo = offs_h < HEAD_SIZE
++    mask_hi = (offs_h + HALF) < HEAD_SIZE
++    query_mask_0 = query_pos < cur_batch_query_len
++    query_mask_1 = query_offset_1 < num_query_heads
++    q_mask = query_mask_0[:, None] & query_mask_1[:, None]
++
++    block_table_offset = seq_idx * block_table_stride
++    M = init_softmax_M(
++        sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, USE_SINKS, IS_3D
++    )
++    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
++    acc_lo = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
++    acc_hi = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
++    context_len = seq_len - cur_batch_query_len
++    dtype = query_ptr.dtype.element_ty
++
++    loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
++        context_len,
++        seq_len,
++        cur_batch_query_len,
++        q_block_local_idx,
++        segm_idx,
++        tiles_per_segment,
++        TILE_SIZE,
++        BLOCK_M,
++        BLOCK_Q,
++        num_queries_per_kv,
++        SLIDING_WINDOW,
++        USE_MM_PREFIX,
++        IS_3D,
++        USE_CAUSAL,
++        False,
++        -1,
++        -1,
++        False,
++        MM_PREFIX_CLAMP_SW,
++        MAX_MM_RANGES,
++        mm_prefix_range_ptr,
++        seq_idx,
++    )
++
++    for j in range(loop_lo, loop_hi):
++        seq_offset = j * TILE_SIZE + offs_t
++        tile_mask = seq_offset < max_seq_prefix_len
++        physical_block_idx = tl.load(
++            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
++        ).to(tl.int64)
++        k_base = (
++            physical_block_idx[None, :] * stride_k_cache_0
++            + kv_head_idx * stride_k_cache_2
++            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
++        )
++        v_base = (
++            physical_block_idx[:, None] * stride_v_cache_0
++            + kv_head_idx * stride_v_cache_2
++            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
++        )
++        # Loop-variant mask: keeps the Q loads (and their shared-memory
++        # staging) inside the loop instead of hoisted and live throughout.
++        qm = q_mask & (j >= loop_lo)
++
++        q_lo = tl.load(query_ptr + q_row + offs_h[None, :], mask=qm & mask_lo[None, :],
++                       other=0.0)
++        k_lo = tl.load(
++            key_cache_ptr + k_base + offs_h[:, None] * stride_k_cache_3,
++            mask=mask_lo[:, None] & tile_mask[None, :],
++            other=0.0,
++        ).to(dtype)
++        S = tl.dot(q_lo, k_lo)
++        q_hi = tl.load(query_ptr + q_row + (offs_h + HALF)[None, :],
++                       mask=qm & mask_hi[None, :], other=0.0)
++        k_hi = tl.load(
++            key_cache_ptr + k_base + (offs_h + HALF)[:, None] * stride_k_cache_3,
++            mask=mask_hi[:, None] & tile_mask[None, :],
++            other=0.0,
++        ).to(dtype)
++        S = scale * (S + tl.dot(q_hi, k_hi))
++
++        if USE_SOFTCAP:
++            S = apply_softcap(S, softcap)
++        seq_mask = compute_kv_seq_mask(
++            context_len + query_pos[:, None],
++            seq_offset,
++            seq_idx,
++            seq_len,
++            mm_prefix_range_ptr,
++            SLIDING_WINDOW,
++            USE_MM_PREFIX,
++            MAX_MM_RANGES,
++            USE_CAUSAL,
++            False,
++            None,
++            None,
++            0,
++            False,
++            -1,
++            -1,
++            MM_PREFIX_CLAMP_SW,
++        )
++        S = tl.where(q_mask & seq_mask, S, float("-inf"))
++
++        M, L, P, alpha = softmax_step(S, M, L)
++        P = P.to(dtype)
++        if SLIDING_WINDOW:
++            # Rows of P that are fully masked still multiply V; zero V
++            # outside the window like the generic kernel does.
++            dist = context_len + q_block_local_idx * BLOCK_Q - seq_offset
++            if USE_CAUSAL:
++                v_ok = tile_mask & (dist < SLIDING_WINDOW)
++            else:
++                v_ok = tile_mask & (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
++        else:
++            v_ok = tile_mask
++
++        v_lo = tl.load(
++            value_cache_ptr + v_base + offs_h[None, :] * stride_v_cache_3,
++            mask=mask_lo[None, :] & v_ok[:, None],
++            other=0.0,
++        ).to(dtype)
++        acc_lo = acc_lo * alpha[:, None] + tl.dot(P, v_lo)
++        v_hi = tl.load(
++            value_cache_ptr + v_base + (offs_h + HALF)[None, :] * stride_v_cache_3,
++            mask=mask_hi[None, :] & v_ok[:, None],
++            other=0.0,
++        ).to(dtype)
++        acc_hi = acc_hi * alpha[:, None] + tl.dot(P, v_hi)
++
++    if IS_3D:
++        segm_row = (
++            query_offset_0[:, None].to(tl.int64)
++            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
++            + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
++            + segm_idx * HEAD_SIZE_PADDED
++        )
++        tl.store(segm_output_ptr + segm_row + offs_h[None, :], acc_lo,
++                 mask=q_mask & mask_lo[None, :])
++        tl.store(segm_output_ptr + segm_row + (offs_h + HALF)[None, :], acc_hi,
++                 mask=q_mask & mask_hi[None, :])
++        store_segm_reduce_scalars(
++            segm_max_ptr,
++            segm_expsum_ptr,
++            query_offset_0,
++            query_offset_1,
++            segm_idx,
++            M,
++            L,
++            query_mask_0,
++            query_mask_1,
++            num_query_heads,
++            NUM_SEGMENTS_PER_SEQ,
++        )
++    else:
++        out_row = (
++            query_offset_0[:, None] * output_stride_0
++            + query_offset_1[:, None] * output_stride_1
++        )
++        tl.store(output_ptr + out_row + offs_h[None, :], acc_lo / L[:, None],
++                 mask=q_mask & mask_lo[None, :])
++        tl.store(output_ptr + out_row + (offs_h + HALF)[None, :],
++                 acc_hi / L[:, None], mask=q_mask & mask_hi[None, :])
++
++
++@triton.jit
++def kernel_pascal_decode_attention(
++    output_ptr,
++    query_ptr,
++    key_cache_ptr,
++    value_cache_ptr,
++    block_tables_ptr,
++    seq_lens_ptr,
++    scale,
++    softcap,
++    num_query_heads: tl.constexpr,
++    num_queries_per_kv: tl.constexpr,
++    QP: tl.constexpr,  # next_power_of_2(num_queries_per_kv)
++    block_table_stride: tl.int64,
++    query_stride_0: tl.int64,
++    query_stride_1: tl.int64,
++    output_stride_0: tl.int64,
++    output_stride_1: tl.int64,
++    BLOCK_SIZE: tl.constexpr,
++    TILE: tl.constexpr,
++    HEAD_SIZE: tl.constexpr,
++    HEAD_SIZE_PADDED: tl.constexpr,
++    USE_SOFTCAP: tl.constexpr,
++    SLIDING_WINDOW: tl.constexpr,
++    stride_k_cache_0: tl.int64,
++    stride_k_cache_1: tl.int64,
++    stride_k_cache_2: tl.int64,
++    stride_k_cache_3: tl.constexpr,
++    stride_v_cache_0: tl.int64,
++    stride_v_cache_1: tl.int64,
++    stride_v_cache_2: tl.int64,
++    stride_v_cache_3: tl.constexpr,
++    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
++    IS_3D: tl.constexpr,
++    segm_output_ptr=None,
++    segm_max_ptr=None,
++    segm_expsum_ptr=None,
++):
++    """One query token per sequence (pure decode). No tl.dot: with 1 token
++    only num_queries_per_kv rows are real, and Pascal's FMA-lowered dot pads
++    them to 16, so explicit multiply-and-reduce does 2-8x less work."""
++    seq_idx = tl.program_id(0)
++    kv_head_idx = tl.program_id(1)
++    segm_idx = tl.program_id(2) if IS_3D else 0
++    seq_len = tl.load(seq_lens_ptr + seq_idx)
++
++    if IS_3D:
++        # Same segment split as reduce_segments (keyed on TILE).
++        tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE)
++        if segm_idx * tiles_per_segment * TILE >= seq_len:
++            return
++        tile_lo = segm_idx * tiles_per_segment
++        tile_hi = tl.minimum(tile_lo + tiles_per_segment, cdiv_fn(seq_len, TILE))
++    else:
++        tile_lo = 0
++        tile_hi = cdiv_fn(seq_len, TILE)
++    if SLIDING_WINDOW > 0:
++        first_key = tl.maximum(seq_len - SLIDING_WINDOW, 0)
++        tile_lo = tl.maximum(tile_lo, first_key // TILE)
++    else:
++        first_key = 0
++
++    offs_q = tl.arange(0, QP)
++    offs_t = tl.arange(0, TILE)
++    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
++    head = kv_head_idx * num_queries_per_kv + offs_q
++    q_ok = offs_q < num_queries_per_kv
++    d_ok = offs_d < HEAD_SIZE
++    q = tl.load(
++        query_ptr + seq_idx * query_stride_0 + head[:, None] * query_stride_1
++        + offs_d[None, :],
++        mask=q_ok[:, None] & d_ok[None, :],
++        other=0.0,
++    ).to(tl.float32)
++
++    M = tl.full([QP], float("-inf"), dtype=tl.float32)
++    L = tl.full([QP], 1.0, dtype=tl.float32)
++    acc = tl.zeros([QP, HEAD_SIZE_PADDED], dtype=tl.float32)
++    bt = block_tables_ptr + seq_idx * block_table_stride
++
++    for j in range(tile_lo, tile_hi):
++        pos = j * TILE + offs_t
++        t_ok = (pos < seq_len) & (pos >= first_key)
++        blk = tl.load(bt + pos // BLOCK_SIZE, mask=t_ok, other=0).to(tl.int64)
++        slot = (pos % BLOCK_SIZE).to(tl.int64)
++        kv_mask = t_ok[:, None] & d_ok[None, :]
++        k = tl.load(
++            key_cache_ptr + blk[:, None] * stride_k_cache_0
++            + slot[:, None] * stride_k_cache_1 + kv_head_idx * stride_k_cache_2
++            + offs_d[None, :] * stride_k_cache_3,
++            mask=kv_mask, other=0.0,
++        ).to(tl.float32)
++        # S : (QP, TILE)
++        S = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
++        if USE_SOFTCAP:
++            S = apply_softcap(S, softcap)
++        S = tl.where(q_ok[:, None] & t_ok[None, :], S, float("-inf"))
++        M, L, P, alpha = softmax_step(S, M, L)
++        v = tl.load(
++            value_cache_ptr + blk[:, None] * stride_v_cache_0
++            + slot[:, None] * stride_v_cache_1 + kv_head_idx * stride_v_cache_2
++            + offs_d[None, :] * stride_v_cache_3,
++            mask=kv_mask, other=0.0,
++        ).to(tl.float32)
++        acc = acc * alpha[:, None] + tl.sum(P[:, :, None] * v[None, :, :], axis=1)
++
++    if IS_3D:
++        row = (
++            seq_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
++            + head * NUM_SEGMENTS_PER_SEQ + segm_idx
++        )
++        tl.store(segm_output_ptr + row[:, None] * HEAD_SIZE_PADDED + offs_d[None, :],
++                 acc, mask=q_ok[:, None] & d_ok[None, :])
++        tl.store(segm_max_ptr + row, M, mask=q_ok)
++        tl.store(segm_expsum_ptr + row, L, mask=q_ok)
++    else:
++        tl.store(
++            output_ptr + seq_idx * output_stride_0 + head[:, None] * output_stride_1
++            + offs_d[None, :],
++            acc / L[:, None],
++            mask=q_ok[:, None] & d_ok[None, :],
++        )
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index b0231dd0c..3d7f7e806 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -1054,6 +1054,28 @@ def unified_attention(
+         or is_batch_invariant
+     )
+ 
++    # Pre-Volta, head_size >= 256: the generic kernel pads 2-12 query rows
++    # per KV head to 16, stages fp32 dot operands in shared memory and spills
++    # (Gemma 4 sliding layers: 0.52 ms -> 0.09 ms decode at c=4, 12.2 -> 2.0 ms
++    # for a 506-token prefill; Qwen 3.8: 2.2 -> 1.7 ms prefill), and d=512
++    # (Gemma 4 global layers) exceeds shared memory outright.
++    if head_size_padded >= 256 and not current_platform.has_device_capability(70):
++        _pascal_splitd_attention(
++            q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, block_table,
++            softcap, sinks,
++            softmax_scale, window_size, use_causal, mm_prefix_range, use_mm_prefix,
++            max_mm_ranges, mm_prefix_clamp_sliding_window, total_num_q_blocks,
++            BLOCK_Q, BLOCK_M, num_seqs, num_query_heads, num_queries_per_kv,
++            head_size, head_size_padded, use_3d, num_par_softmax_segments,
++            softmax_segm_output, softmax_segm_max, softmax_segm_expsum,
++            unsupported=(
++                use_td or use_per_seq_causal or use_rswa or use_alibi_slopes
++                or use_qq_bias or output_scale is not None or chunk_lookback > -1
++                or kv_quant_mode != KVQuantMode.NONE or is_batch_invariant
++            ),
++        )
++        return
++
+     # The kernel signature is the same for 2D and 3D — only the launch
+     # grid + a handful of constexpr toggles differ.  Per-token-head scale
+     # caches and their strides are passed as ``None`` when the
+@@ -1192,3 +1214,172 @@ def unified_attention(
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+             USE_FP8=output_scale is not None,
+         )
++
++
++def _pascal_splitd_attention(
++    q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, block_table, softcap,
++    sinks,
++    softmax_scale, window_size, use_causal, mm_prefix_range, use_mm_prefix,
++    max_mm_ranges, mm_prefix_clamp_sliding_window, total_num_q_blocks,
++    BLOCK_Q, BLOCK_M, num_seqs, num_query_heads, num_queries_per_kv,
++    head_size, head_size_padded, use_3d, num_par_softmax_segments,
++    softmax_segm_output, softmax_segm_max, softmax_segm_expsum, unsupported,
++):
++    """head_size > 256 on pre-Volta: see pascal_splitd_attention.py."""
++    from vllm.v1.attention.ops.pascal_splitd_attention import (
++        TILE_SIZE,
++        kernel_pascal_decode_attention,
++        kernel_splitd_attention,
++    )
++
++    if unsupported:
++        raise NotImplementedError(
++            "head_size > 256 on pre-Volta GPUs only supports plain causal / "
++            "sliding-window attention with an unquantized KV cache"
++        )
++    if max_seqlen_q == 1 and sinks is None and not use_mm_prefix and use_causal:
++        # Tile so the (QP, TILE, HEAD) product is <= 16384 fp32 over 4 warps:
++        # Gemma 4 sliding (QP 2, d 256) -> 16, global (QP 8, d 512) -> 4.
++        warps = 4
++        qp = triton.next_power_of_2(num_queries_per_kv)
++        tile = max(1, min(16, 16384 // (qp * head_size_padded)))
++        segs = num_par_softmax_segments if use_3d else 1
++        kernel_pascal_decode_attention[(num_seqs, k.shape[2], segs)](
++            output_ptr=out,
++            query_ptr=q,
++            key_cache_ptr=k,
++            value_cache_ptr=v,
++            block_tables_ptr=block_table,
++            seq_lens_ptr=seqused_k,
++            scale=softmax_scale,
++            softcap=softcap,
++            num_query_heads=num_query_heads,
++            num_queries_per_kv=num_queries_per_kv,
++            QP=qp,
++            block_table_stride=block_table.stride(0),
++            query_stride_0=q.stride(0),
++            query_stride_1=q.stride(1),
++            output_stride_0=out.stride(0),
++            output_stride_1=out.stride(1),
++            BLOCK_SIZE=v.shape[1],
++            TILE=tile,
++            HEAD_SIZE=head_size,
++            HEAD_SIZE_PADDED=head_size_padded,
++            USE_SOFTCAP=(softcap > 0),
++            SLIDING_WINDOW=(1 + window_size[0]),
++            stride_k_cache_0=k.stride(0),
++            stride_k_cache_1=k.stride(1),
++            stride_k_cache_2=k.stride(2),
++            stride_k_cache_3=k.stride(3),
++            stride_v_cache_0=v.stride(0),
++            stride_v_cache_1=v.stride(1),
++            stride_v_cache_2=v.stride(2),
++            stride_v_cache_3=v.stride(3),
++            NUM_SEGMENTS_PER_SEQ=segs,
++            IS_3D=use_3d,
++            segm_output_ptr=softmax_segm_output if use_3d else None,
++            segm_max_ptr=softmax_segm_max if use_3d else None,
++            segm_expsum_ptr=softmax_segm_expsum if use_3d else None,
++            num_warps=warps,
++            num_stages=1,
++        )
++        if use_3d:
++            _reduce(q, out, softmax_segm_output, softmax_segm_max,
++                    softmax_segm_expsum, seqused_k, num_seqs, num_query_heads,
++                    block_table, tile, head_size, head_size_padded, cu_seqlens_q,
++                    BLOCK_Q, segs)
++        return
++    tile_sz = TILE_SIZE
++    if head_size_padded <= 256 and not use_3d:
++        # Prefill at d=256: 32-row blocks x 32-key tiles (506-token prompt:
++        # Gemma 4 sliding 2.86 -> 1.97 ms, Qwen 3.8 3.08 -> 1.70 ms). d=512
++        # has no shared memory left for either.
++        tile_sz = 32
++        BLOCK_M = max(32, triton.next_power_of_2(num_queries_per_kv))
++        BLOCK_Q = BLOCK_M // num_queries_per_kv
++        total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
++    if use_3d:
++        grid = (total_num_q_blocks, k.shape[2], num_par_softmax_segments)
++    else:
++        grid = (total_num_q_blocks, k.shape[2])
++    kernel_splitd_attention[grid](
++        output_ptr=out,
++        query_ptr=q,
++        key_cache_ptr=k,
++        value_cache_ptr=v,
++        sink_ptr=sinks,
++        block_tables_ptr=block_table,
++        seq_lens_ptr=seqused_k,
++        scale=softmax_scale,
++        softcap=softcap,
++        num_query_heads=num_query_heads,
++        num_queries_per_kv=num_queries_per_kv,
++        block_table_stride=block_table.stride(0),
++        query_stride_0=q.stride(0),
++        query_stride_1=q.stride(1),
++        output_stride_0=out.stride(0),
++        output_stride_1=out.stride(1),
++        BLOCK_SIZE=v.shape[1],
++        TILE_SIZE=tile_sz,
++        HEAD_SIZE=head_size,
++        HALF=head_size_padded // 2,
++        USE_SOFTCAP=(softcap > 0),
++        USE_SINKS=(sinks is not None),
++        SLIDING_WINDOW=(1 + window_size[0]),
++        USE_CAUSAL=use_causal,
++        USE_MM_PREFIX=use_mm_prefix,
++        MAX_MM_RANGES=max_mm_ranges,
++        mm_prefix_range_ptr=mm_prefix_range,
++        stride_k_cache_0=k.stride(0),
++        stride_k_cache_1=k.stride(1),
++        stride_k_cache_2=k.stride(2),
++        stride_k_cache_3=k.stride(3),
++        stride_v_cache_0=v.stride(0),
++        stride_v_cache_1=v.stride(1),
++        stride_v_cache_2=v.stride(2),
++        stride_v_cache_3=v.stride(3),
++        query_start_len_ptr=cu_seqlens_q,
++        BLOCK_Q=BLOCK_Q,
++        num_seqs=num_seqs,
++        BLOCK_M=BLOCK_M,
++        NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments if use_3d else 1,
++        IS_3D=use_3d,
++        segm_output_ptr=softmax_segm_output if use_3d else None,
++        segm_max_ptr=softmax_segm_max if use_3d else None,
++        segm_expsum_ptr=softmax_segm_expsum if use_3d else None,
++        MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
++        num_stages=1,
++        # 4 warps needs >255 registers/thread (two 16x256 fp32 accumulators
++        # plus FMA-dot operands) and spills ~10 KB; 16 warps is slower again.
++        num_warps=8,
++    )
++    if use_3d:
++        _reduce(q, out, softmax_segm_output, softmax_segm_max,
++                softmax_segm_expsum, seqused_k, num_seqs, num_query_heads,
++                block_table, TILE_SIZE, head_size, head_size_padded, cu_seqlens_q,
++                BLOCK_Q, num_par_softmax_segments)
++
++
++def _reduce(q, out, segm_output, segm_max, segm_expsum, seqused_k, num_seqs,
++            num_query_heads, block_table, tile, head_size, head_size_padded,
++            cu_seqlens_q, BLOCK_Q, segs):
++    reduce_segments[(q.shape[0], num_query_heads)](
++        output_ptr=out,
++        segm_output_ptr=segm_output,
++        segm_max_ptr=segm_max,
++        segm_expsum_ptr=segm_expsum,
++        seq_lens_ptr=seqused_k,
++        num_seqs=num_seqs,
++        num_query_heads=num_query_heads,
++        out_scale_inv=1.0,
++        output_stride_0=out.stride(0),
++        output_stride_1=out.stride(1),
++        block_table_stride=block_table.stride(0),
++        TILE_SIZE=tile,
++        HEAD_SIZE=head_size,
++        HEAD_SIZE_PADDED=head_size_padded,
++        query_start_len_ptr=cu_seqlens_q,
++        BLOCK_Q=BLOCK_Q,
++        NUM_SEGMENTS_PER_SEQ=segs,
++        USE_FP8=False,
++    )
+-- 
+2.53.0
+

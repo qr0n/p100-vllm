@@ -1,0 +1,430 @@
+From 70bba49d773d694c9fe5fc3769919e937b1a480a Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:40:40 +0000
+Subject: [PATCH 4/7] [Pascal] Host-mapped two-rank all-reduce; disable the IPC
+ custom all-reduce
+
+The IPC custom all-reduce spin-waits on peer memory and hangs on Pascal PCIe
+cards behind different CPU sockets. PascalHostAllreduce exchanges through
+mapped pinned host memory in one graph-capturable kernel: 19.5 vs 33.5 us per
+decode-sized all-reduce against NCCL. VLLM_PASCAL_HOST_ALLREDUCE=0 disables it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |   3 +-
+ csrc/libtorch_stable/pascal_host_allreduce.cu | 167 ++++++++++++++++++
+ .../device_communicators/cuda_communicator.py |  36 ++++
+ .../pascal_host_all_reduce.py                 | 117 ++++++++++++
+ 4 files changed, 322 insertions(+), 1 deletion(-)
+ create mode 100644 csrc/libtorch_stable/pascal_host_allreduce.cu
+ create mode 100644 vllm/distributed/device_communicators/pascal_host_all_reduce.py
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2cc3da562..1b7374c7b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -479,7 +479,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+       "csrc/libtorch_stable/hisparse_kernels.cu"
+       "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu"
+       "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_kv_gather.cu"
+-      "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_q_gather.cu")
++      "csrc/libtorch_stable/attention/dcp_utils/dcp_direct_q_gather.cu"
++      "csrc/libtorch_stable/pascal_host_allreduce.cu")
+ 
+     SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+ 
+diff --git a/csrc/libtorch_stable/pascal_host_allreduce.cu b/csrc/libtorch_stable/pascal_host_allreduce.cu
+new file mode 100644
+index 000000000..852c5e0c4
+--- /dev/null
++++ b/csrc/libtorch_stable/pascal_host_allreduce.cu
+@@ -0,0 +1,167 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// Two-rank all-reduce through mapped pinned HOST memory, for GPUs where the
++// IPC/P2P custom all-reduce is unusable (e.g. Pascal PCIe cards on different
++// CPU sockets: peer access "works" but spin-waiting across the socket link
++// hangs). Each rank streams its tensor into its own slot of a shared host
++// buffer, publishes a per-block arrival token, waits for the peer's token and
++// adds the peer's slot to its own input. For decode-sized tensors this beats
++// NCCL's ring (which also stages through host memory without P2P) because it
++// is a single kernel with no protocol overhead.
++//
++// - CUDA-graph safe: the token is a per-block counter in device memory, so no
++//   host-side argument changes between replays.
++// - Two data slots per rank (token parity): the ranks run in lockstep, so a
++//   rank can be at most one call ahead and never overwrites data its peer is
++//   still reading.
++// - Both ranks add the same two fp16 values in fp32 and round once, so the
++//   results are bit-identical across ranks.
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <torch/csrc/stable/library.h>
++#include <torch/headeronly/core/ScalarType.h>
++
++#include <cstdint>
++#include <string>
++#include <type_traits>
++
++#include "torch_utils.h"
++
++namespace {
++
++constexpr int kBlocks = 8;
++constexpr int kThreads = 512;
++constexpr int kFlagStrideInts = 16;  // one 64-byte line per block's arrival int
++constexpr long long kBackoffCycles = 128;
++
++template <typename T>
++__device__ __forceinline__ float to_f(T v) {
++  if constexpr (std::is_same_v<T, float>) {
++    return v;
++  } else if constexpr (std::is_same_v<T, __half>) {
++    return __half2float(v);
++  } else {
++    return __bfloat162float(v);
++  }
++}
++
++template <typename T>
++__device__ __forceinline__ T from_f(float v) {
++  if constexpr (std::is_same_v<T, float>) {
++    return v;
++  } else if constexpr (std::is_same_v<T, __half>) {
++    return __float2half_rn(v);
++  } else {
++    return __float2bfloat16_rn(v);
++  }
++}
++
++// n_vec 16-byte vectors; the host slots are laid out [slot 0 | slot 1], each
++// slot_bytes long.
++template <typename T>
++__global__ void __launch_bounds__(kThreads)
++    host_allreduce_kernel(const uint4* __restrict__ inp, uint4* __restrict__ out,
++                          int64_t n_vec, char* mine, const char* other,
++                          int* flags_mine, const int* flags_other,
++                          int* counters, int64_t slot_bytes) {
++  __shared__ int token_s;
++  const int b = blockIdx.x;
++  if (threadIdx.x == 0) token_s = counters[b] + 1;
++  __syncthreads();
++  const int token = token_s;
++  const int64_t slot_off = (token & 1) * slot_bytes;
++  uint4* my_slot = reinterpret_cast<uint4*>(mine + slot_off);
++  const uint4* peer_slot = reinterpret_cast<const uint4*>(other + slot_off);
++
++  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
++  const int64_t start = (int64_t)b * blockDim.x + threadIdx.x;
++
++  // Phase 1: publish this rank's stripe.
++  for (int64_t i = start; i < n_vec; i += stride) my_slot[i] = inp[i];
++  __threadfence_system();
++  __syncthreads();
++
++  // Phase 2: signal this block's arrival, wait for the peer's matching block.
++  if (threadIdx.x == 0) {
++    *reinterpret_cast<volatile int*>(flags_mine + b * kFlagStrideInts) = token;
++    __threadfence_system();
++    const volatile int* peer_flag = flags_other + b * kFlagStrideInts;
++    while (*peer_flag != token) {
++      const long long t0 = clock64();
++      while (clock64() - t0 < kBackoffCycles) {
++      }
++    }
++    counters[b] = token;
++  }
++  __syncthreads();
++  __threadfence_system();
++
++  // Phase 3: out = mine + peer, summed in fp32 (identical on both ranks).
++  constexpr int kElems = 16 / sizeof(T);
++  for (int64_t i = start; i < n_vec; i += stride) {
++    uint4 a = inp[i];
++    // One 16-byte load that bypasses the caches (ld.global.cv): the slot is
++    // rewritten by the peer every other call.
++    const uint4 p = __ldcv(peer_slot + i);
++    const T* av = reinterpret_cast<const T*>(&a);
++    const T* pv = reinterpret_cast<const T*>(&p);
++    uint4 r;
++    T* rv = reinterpret_cast<T*>(&r);
++#pragma unroll
++    for (int k = 0; k < kElems; ++k) rv[k] = from_f<T>(to_f(av[k]) + to_f(pv[k]));
++    out[i] = r;
++  }
++}
++
++void pascal_host_allreduce(const torch::stable::Tensor& inp,
++                           torch::stable::Tensor& out, int64_t mine,
++                           int64_t other, int64_t flags_mine,
++                           int64_t flags_other, torch::stable::Tensor& counters,
++                           int64_t slot_bytes) {
++  const int64_t nbytes = inp.numel() * inp.element_size();
++  STD_TORCH_CHECK(nbytes % 16 == 0 && nbytes <= slot_bytes,
++                  "pascal_host_allreduce: size must be a multiple of 16 bytes "
++                  "and fit one slot");
++  STD_TORCH_CHECK(counters.numel() >= kBlocks,
++                  "pascal_host_allreduce: counters too small");
++  const int64_t n_vec = nbytes / 16;
++  cudaStream_t stream = get_current_cuda_stream();
++  auto launch = [&]<typename T>() {
++    host_allreduce_kernel<T><<<kBlocks, kThreads, 0, stream>>>(
++        reinterpret_cast<const uint4*>(inp.data_ptr()),
++        reinterpret_cast<uint4*>(out.mutable_data_ptr()), n_vec,
++        reinterpret_cast<char*>(mine), reinterpret_cast<const char*>(other),
++        reinterpret_cast<int*>(flags_mine),
++        reinterpret_cast<const int*>(flags_other),
++        counters.mutable_data_ptr<int32_t>(), slot_bytes);
++  };
++  const auto dt = inp.scalar_type();
++  if (dt == torch::headeronly::ScalarType::Half) {
++    launch.operator()<__half>();
++  } else if (dt == torch::headeronly::ScalarType::BFloat16) {
++    launch.operator()<__nv_bfloat16>();
++  } else {
++    STD_TORCH_CHECK(dt == torch::headeronly::ScalarType::Float,
++                    "pascal_host_allreduce: unsupported dtype");
++    launch.operator()<float>();
++  }
++  const cudaError_t err = cudaGetLastError();
++  STD_TORCH_CHECK(err == cudaSuccess, std::string("pascal_host_allreduce: ") +
++                                          cudaGetErrorString(err));
++}
++
++}  // namespace
++
++STABLE_TORCH_LIBRARY_FRAGMENT(_C, pascal_host_allreduce_ops) {
++  pascal_host_allreduce_ops.def(
++      "pascal_host_allreduce(Tensor inp, Tensor! out, int mine, int other, "
++      "int flags_mine, int flags_other, Tensor! counters, int slot_bytes) "
++      "-> ()");
++}
++
++STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, pascal_host_allreduce_ops) {
++  pascal_host_allreduce_ops.impl("pascal_host_allreduce",
++                                 TORCH_BOX(&pascal_host_allreduce));
++}
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index fb0c281b4..1534f2f4f 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ from torch.distributed import ProcessGroup
+ 
+@@ -72,6 +74,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 rocm_aiter_ops.is_custom_all_reduce_enabled()
+             )
+ 
++        # Pre-Volta (Pascal) PCIe cards: the IPC custom all-reduce spin-waits on
++        # peer memory, which hangs when the GPUs sit behind different CPU
++        # sockets. Use the host-mapped PascalHostAllreduce below instead.
++        is_pre_volta = current_platform.is_cuda() and not (
++            current_platform.has_device_capability(70)
++        )
++        if use_custom_allreduce and is_pre_volta:
++            logger.info_once(
++                "Custom all-reduce disabled on pre-Volta GPUs; using the "
++                "host-mapped all-reduce instead.",
++                scope="global",
++            )
++            use_custom_allreduce = False
++        use_pascal_host_allreduce = (
++            is_pre_volta
++            and unique_name.split(":")[0] == "tp"
++            and os.environ.get("VLLM_PASCAL_HOST_ALLREDUCE", "1") != "0"
++        )
++
+         self.use_custom_allreduce = use_custom_allreduce
+         self.use_torch_symm_mem = use_torch_symm_mem
+         self.use_flashinfer_allreduce = use_flashinfer_allreduce
+@@ -88,6 +109,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
+             FlashInferPcieIpcAllReduce,
+         )
++        from vllm.distributed.device_communicators.pascal_host_all_reduce import (
++            PascalHostAllreduce,
++        )
+         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+         from vllm.distributed.device_communicators.quick_all_reduce import (
+             QuickAllReduce,
+@@ -104,6 +128,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 register_nccl_symmetric_ops(self.pynccl_comm)
+ 
+         self.ca_comm: CustomAllreduce | None = None
++        self.pascal_ar_comm: PascalHostAllreduce | None = None
++        if use_pascal_host_allreduce and self.world_size == 2:
++            self.pascal_ar_comm = PascalHostAllreduce(self.cpu_group, self.device)
+         self.qr_comm: QuickAllReduce | None = None
+         self.symm_mem_comm: SymmMemCommunicator | None = None
+         self.fi_ar_comm: FlashInferAllReduce | None = None
+@@ -274,6 +301,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             "AITER_CUSTOM",
+             "CUSTOM",
+             "SYMM_MEM",
++            "PASCAL_HOST",
+             "PYNCCL",
+         ]
+         enabled_ar_backends: list[str] = []
+@@ -320,6 +348,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             enabled_ar_backends.append("CUSTOM")
+         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
+             enabled_ar_backends.append("SYMM_MEM")
++        if self.pascal_ar_comm is not None and not self.pascal_ar_comm.disabled:
++            enabled_ar_backends.append("PASCAL_HOST")
+         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
+             enabled_ar_backends.append("PYNCCL")
+ 
+@@ -391,6 +421,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             out = symm_mem_comm.all_reduce(input_)
+             assert out is not None
+             return out
++        pascal_ar_comm = self.pascal_ar_comm
++        if pascal_ar_comm is not None and pascal_ar_comm.should_use(input_):
++            return pascal_ar_comm.all_reduce(input_)
+         pynccl_comm = self.pynccl_comm
+         if pynccl_comm is None or pynccl_comm.disabled:
+             out = input_.clone()
+@@ -664,6 +697,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             self.pynccl_comm = None
+         if self.ca_comm is not None:
+             self.ca_comm = None
++        if self.pascal_ar_comm is not None:
++            self.pascal_ar_comm.close()
++            self.pascal_ar_comm = None
+         if self.aiter_ar_comm is not None:
+             self.aiter_ar_comm.close()
+             self.aiter_ar_comm = None
+diff --git a/vllm/distributed/device_communicators/pascal_host_all_reduce.py b/vllm/distributed/device_communicators/pascal_host_all_reduce.py
+new file mode 100644
+index 000000000..557b2ccf2
+--- /dev/null
++++ b/vllm/distributed/device_communicators/pascal_host_all_reduce.py
+@@ -0,0 +1,117 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Two-rank all-reduce through mapped pinned host memory (pre-Volta GPUs).
++
++vLLM's IPC custom all-reduce spin-waits on flags in the peer GPU's memory. On
++Pascal PCIe cards behind different CPU sockets, peer access reports as
++available but those spins never complete, so the engine hangs. NCCL works but
++costs ~33 us per decode-sized all-reduce (this: ~19.5 us). This backend has each rank
++write its tensor into a POSIX shared-memory buffer that both worker processes
++register with ``cudaHostRegister`` (mapped), exchange per-block arrival tokens
++there, and add the peer's copy on the GPU: one kernel, graph-capturable.
++See csrc/libtorch_stable/pascal_host_allreduce.cu for the protocol.
++"""
++
++import ctypes
++import uuid
++from multiprocessing import shared_memory
++
++import torch
++import torch.distributed as dist
++from torch.distributed import ProcessGroup
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_BLOCKS = 8  # must match kBlocks in pascal_host_allreduce.cu
++_FLAG_BYTES = _BLOCKS * 64
++_CUDA_HOST_REGISTER_PORTABLE = 1
++_CUDA_HOST_REGISTER_MAPPED = 2
++
++
++class PascalHostAllreduce:
++    def __init__(
++        self, group: ProcessGroup, device: torch.device, max_bytes: int = 1 << 20
++    ):
++        self.disabled = True
++        self.group = group
++        self.rank = dist.get_rank(group)
++        self.world_size = dist.get_world_size(group)
++        if self.world_size != 2:
++            return
++        self.max_bytes = max_bytes
++        # Per rank: [flags | slot 0 | slot 1].
++        self.rank_bytes = _FLAG_BYTES + 2 * max_bytes
++        total = 2 * self.rank_bytes
++
++        name = [f"vllm_pascal_ar_{uuid.uuid4().hex[:16]}" if self.rank == 0 else None]
++        if self.rank == 0:
++            self._shm = shared_memory.SharedMemory(name=name[0], create=True, size=total)
++            ctypes.memset(self._addr(), 0, total)
++        dist.broadcast_object_list(name, src=dist.get_global_rank(group, 0), group=group)
++        if self.rank != 0:
++            self._shm = shared_memory.SharedMemory(name=name[0])
++        dist.barrier(group=group)
++        if self.rank == 0:
++            # Both ranks have it mapped; drop the name so it cannot leak.
++            self._shm.unlink()
++
++        base = self._addr()
++        err = torch.cuda.cudart().cudaHostRegister(
++            base, total, _CUDA_HOST_REGISTER_PORTABLE | _CUDA_HOST_REGISTER_MAPPED
++        )
++        if int(err) != 0:
++            logger.warning("PascalHostAllreduce: cudaHostRegister failed (%s)", err)
++            return
++        self._registered = base
++        # With unified addressing the registered host pointer is also the
++        # device pointer.
++        mine = base + self.rank * self.rank_bytes
++        other = base + (1 - self.rank) * self.rank_bytes
++        self.flags_mine, self.flags_other = mine, other
++        self.data_mine, self.data_other = mine + _FLAG_BYTES, other + _FLAG_BYTES
++        self.counters = torch.zeros(_BLOCKS, dtype=torch.int32, device=device)
++        dist.barrier(group=group)
++        self.disabled = False
++        logger.info(
++            "PascalHostAllreduce enabled (host-mapped, up to %d bytes per call).",
++            max_bytes,
++        )
++
++    def _addr(self) -> int:
++        if getattr(self, "_cbuf", None) is None:
++            self._cbuf = ctypes.c_char.from_buffer(self._shm.buf)
++        return ctypes.addressof(self._cbuf)
++
++    def should_use(self, inp: torch.Tensor) -> bool:
++        if self.disabled:
++            return False
++        nbytes = inp.numel() * inp.element_size()
++        return (
++            inp.is_contiguous()
++            and inp.dtype in (torch.float16, torch.bfloat16, torch.float32)
++            and nbytes % 16 == 0
++            and 0 < nbytes <= self.max_bytes
++        )
++
++    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
++        out = torch.empty_like(inp)
++        torch.ops._C.pascal_host_allreduce(
++            inp, out, self.data_mine, self.data_other, self.flags_mine,
++            self.flags_other, self.counters, self.max_bytes,
++        )
++        return out
++
++    def close(self) -> None:
++        if getattr(self, "_registered", None):
++            torch.cuda.cudart().cudaHostUnregister(self._registered)
++            self._registered = None
++        self._cbuf = None  # release the buffer export before closing
++        shm = getattr(self, "_shm", None)
++        if shm is not None:
++            shm.close()
++            self._shm = None
++
++    def __del__(self):
++        self.close()
+-- 
+2.53.0
+

@@ -1,0 +1,168 @@
+From 51761612263cbf8ee5da84cb081c9f55bb2888ae Mon Sep 17 00:00:00 2001
+From: qr0n <77075118+qr0n@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:40:40 +0000
+Subject: [PATCH 5/7] [Pascal] Small-M Triton GEMM for large unquantized
+ matrices (lm_head)
+
+cuBLAS pads decode-sized GEMMs to 64-row tiles on sm_60; for N >= 4096 (the
+248k-vocab lm_head) a skinny Triton kernel reads the weight once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/pascal_skinny_gemm.py              | 87 +++++++++++++++++++
+ vllm/model_executor/layers/utils.py           | 38 ++++++++
+ 2 files changed, 125 insertions(+)
+ create mode 100644 vllm/model_executor/layers/pascal_skinny_gemm.py
+
+diff --git a/vllm/model_executor/layers/pascal_skinny_gemm.py b/vllm/model_executor/layers/pascal_skinny_gemm.py
+new file mode 100644
+index 000000000..c2c40febb
+--- /dev/null
++++ b/vllm/model_executor/layers/pascal_skinny_gemm.py
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Small-M fp16 GEMM for Pascal (sm_6x).
++
++For decode-sized batches cuBLAS on sm_60 picks 64x64-tiled kernels, so a
++4-row activation times the (vocab x hidden) lm_head does ~16x padded math and
++runs compute-bound at ~100 GB/s. This kernel streams each weight row block once
++and reuses it for every activation row, which keeps it bandwidth-bound:
++measured on a P100 for a 31040 x 5120 fp16 weight, M=4 goes from 3.08 ms
++(F.linear) to 0.62 ms (509 GB/s).
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# Largest M this kernel is used for; beyond it the per-row FMAs make it
++# compute-bound and cuBLAS is competitive again.
++MAX_M = 8
++# Smallest weight height (output features) worth it: the grid is N / BN
++# programs, so a 96-row projection would launch only ~6 and take ~46 us where
++# cuBLAS takes ~10 us.
++MIN_N = 4096
++
++# (BN, BK, num_warps) per padded M, tuned on a Tesla P100 (see module doc).
++_CONFIGS = {1: (64, 256, 8), 2: (16, 256, 4), 4: (16, 256, 2), 8: (32, 128, 2)}
++
++
++@triton.jit
++def _skinny_gemm_kernel(
++    X, W, O, M, N, K, sxm, swn, som,
++    MP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++):
++    # O[M, N] = X[M, K] @ W[N, K]^T. Each program owns BN rows of W, streams
++    # them once, and reuses each loaded tile for all M activation rows.
++    pid = tl.program_id(0)
++    rn = pid * BN + tl.arange(0, BN)
++    rm = tl.arange(0, MP)
++    acc = tl.zeros((MP, BN), dtype=tl.float32)
++    for k0 in range(0, K, BK):
++        rk = k0 + tl.arange(0, BK)
++        w = tl.load(
++            W + rn[:, None] * swn + rk[None, :],
++            mask=(rn[:, None] < N) & (rk[None, :] < K),
++            other=0.0,
++        ).to(tl.float32)
++        for m in tl.static_range(MP):
++            xm = tl.load(X + m * sxm + rk, mask=(rk < K) & (m < M), other=0.0)
++            part = tl.sum(w * xm.to(tl.float32)[None, :], axis=1)
++            acc += tl.where(rm[:, None] == m, part[None, :], 0.0)
++    tl.store(
++        O + rm[:, None] * som + rn[None, :],
++        acc.to(O.dtype.element_ty),
++        mask=(rm[:, None] < M) & (rn[None, :] < N),
++    )
++
++
++def supports(x: torch.Tensor, weight: torch.Tensor) -> bool:
++    return (
++        x.dtype == torch.float16
++        and weight.dtype == torch.float16
++        and weight.dim() == 2
++        and weight.shape[0] >= MIN_N
++        and weight.stride(1) == 1
++        and x.numel() // x.shape[-1] <= MAX_M
++    )
++
++
++def skinny_gemm(
++    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
++) -> torch.Tensor:
++    x2 = x.reshape(-1, x.shape[-1])
++    if x2.stride(-1) != 1:
++        x2 = x2.contiguous()
++    M, K = x2.shape
++    N = weight.shape[0]
++    out = torch.empty(M, N, device=x.device, dtype=x.dtype)
++    if M > 0:
++        mp = triton.next_power_of_2(M)
++        bn, bk, nw = _CONFIGS[mp]
++        _skinny_gemm_kernel[(triton.cdiv(N, bn),)](
++            x2, weight, out, M, N, K, x2.stride(0), weight.stride(0), out.stride(0),
++            MP=mp, BN=bn, BK=bk, num_warps=nw,
++        )
++    if bias is not None:
++        out += bias
++    return out.reshape(*x.shape[:-1], N)
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index af8b7d4d5..3662afc10 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -394,6 +394,40 @@ direct_register_custom_op(
+ )
+ 
+ 
++def pascal_unquantized_gemm_impl(
++    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
++) -> torch.Tensor:
++    from vllm.model_executor.layers import pascal_skinny_gemm
++
++    if pascal_skinny_gemm.supports(x, weight):
++        return pascal_skinny_gemm.skinny_gemm(x, weight, bias)
++    return torch.nn.functional.linear(x, weight, bias)
++
++
++def pascal_unquantized_gemm_fake(
++    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
++) -> torch.Tensor:
++    return x.new_empty((*x.shape[:-1], weight.shape[0]))
++
++
++def pascal_unquantized_gemm(
++    layer: torch.nn.Module,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    if not x.is_cuda:
++        return default_unquantized_gemm(layer, x, weight, bias)
++    return torch.ops.vllm.pascal_unquantized_gemm(x, weight, bias)
++
++
++direct_register_custom_op(
++    op_name="pascal_unquantized_gemm",
++    op_func=pascal_unquantized_gemm_impl,
++    fake_impl=pascal_unquantized_gemm_fake,
++)
++
++
+ @functools.cache
+ def warmup_rocm_skinny_gemm_workspaces(device: torch.device) -> None:
+     """Eagerly allocate wvSplitKrc's per-device split-K workspace pool.
+@@ -608,6 +642,10 @@ def dispatch_unquantized_gemm(
+         return cpu_unquantized_gemm
+     elif not current_platform.is_cuda():
+         return default_unquantized_gemm
++    elif not current_platform.has_device_capability(70):
++        # Pascal: cuBLAS pads decode-sized GEMMs to 64-row tiles; see
++        # pascal_skinny_gemm.py.
++        return pascal_unquantized_gemm
+ 
+     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
+     if backend_spec is None:
+-- 
+2.53.0
+
